@@ -3,15 +3,15 @@ python = "3.12"
 
 [tasks.format]
 description = "Format code with ruff"
-run = "ruff format ."
+run = "uv run ruff format ."
 
 [tasks.lint]
 description = "Lint with ruff"
-run = "ruff check ."
+run = "uv run ruff check ."
 
 [tasks.typecheck]
 description = "Type-check with basedpyright"
-run = "basedpyright"
+run = "uv run basedpyright"
 
 [tasks.checks]
 description = "Run format, lint, and type-check"
@@ -19,7 +19,7 @@ depends = ["format", "lint", "typecheck"]
 
 [tasks.tests]
 description = "Run tests with pytest"
-run = "pytest"
+run = "uv run pytest"
 
 [tasks.ci]
 description = "Run tests and checks (for CI)"

@@ -326,7 +326,7 @@ class HTTPExporter:
                     "resource": {"attributes": resource_attr_list},
                     "scopeSpans": [
                         {
-                            "scope": {"name": "tracing.py", "version": "0.1.0"},
+                            "scope": {"name": "picotel", "version": "0.1.0"},
                             "spans": otlp_spans,
                         }
                     ],
