@@ -33,7 +33,6 @@ __all__ = [
     "ConsoleExporter",
     "HTTPExporter",
     "Tracer",
-    "TracingMiddleware",
     "tracer_from_env",
 ]
 
@@ -776,70 +775,3 @@ def tracer_from_env() -> Tracer:
         service_name=service_name,
         exporters=exporters,
     )
-
-
-# ---------------------------------------------------------------------------
-# FastAPI / ASGI middleware (optional integration)
-# ---------------------------------------------------------------------------
-
-
-class TracingMiddleware:
-    """ASGI middleware that creates a root span for every HTTP request.
-
-    Stores the span on ``scope["state"]`` / ``request.state.span`` so
-    downstream FastAPI dependencies can access it explicitly.
-    """
-
-    def __init__(self, app: Any, tracer: Tracer):
-        self._app = app
-        self._tracer = tracer
-
-    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope["type"] != "http":
-            await self._app(scope, receive, send)
-            return
-
-        headers = dict(scope.get("headers", []))
-        traceparent_raw = headers.get(b"traceparent", b"").decode("latin-1")
-        parent = TraceparentHeader.parse(traceparent_raw)
-
-        method = scope.get("method", "GET")
-        path = scope.get("path", "/")
-        attrs: _Attributes = {
-            "http.method": method,
-            "http.route": path,
-            "http.url": path,
-        }
-
-        # Extra metadata if available
-        if "client" in scope and scope["client"]:
-            attrs["client.address"] = str(scope["client"][0])
-        user_agent = headers.get(b"user-agent", b"").decode("latin-1")
-        if user_agent:
-            attrs["user_agent.original"] = user_agent
-
-        span = self._tracer.start_span(
-            name=f"{method} {path}",
-            parent=parent,
-            attributes=attrs,
-            kind=2,  # SERVER
-        )
-
-        async def send_wrapper(message: dict[str, Any]) -> None:
-            if message["type"] == "http.response.start":
-                status_code = message.get("status", 0)
-                span.attributes["http.status_code"] = status_code
-            await send(message)
-
-        if "state" not in scope:
-            scope["state"] = {}
-        scope["state"]["span"] = span
-
-        exc_info: _ExcInfo | None = None
-        try:
-            await self._app(scope, receive, send_wrapper)
-        except BaseException:
-            exc_info = sys.exc_info()  # type: ignore[assignment]
-            raise
-        finally:
-            span.finish(exc_info=exc_info)

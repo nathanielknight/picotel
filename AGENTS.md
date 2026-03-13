@@ -31,7 +31,6 @@ picotel/
   - `span.traceparent()` — W3C traceparent header for propagation
 - **`ConsoleExporter`** — Prints spans as JSON to stderr.
 - **`HTTPExporter`** — Batches and POSTs spans as OTLP/HTTP JSON. Service name and default attributes are forwarded from the `Tracer`.
-- **`TracingMiddleware`** — ASGI middleware for FastAPI/Starlette.
 - **`tracer_from_env()`** — Build a Tracer from standard `OTEL_*` environment variables.
 
 Internal types that exist but are **not** in `__all__`:
