@@ -31,7 +31,27 @@ FastAPI integration example
     #   app.add_middleware(TracingMiddleware, tracer=app.state.tracer)
     # (see TracingMiddleware below)
 """
+
 from __future__ import annotations
+
+try:
+    from importlib.metadata import version as _pkg_version
+
+    _VERSION = _pkg_version("picotel")
+except Exception:
+    _VERSION = "unknown"
+
+__all__ = [
+    "Span",
+    "FinishedSpan",
+    "TraceparentHeader",
+    "Exporter",
+    "ConsoleExporter",
+    "HTTPExporter",
+    "Tracer",
+    "TracingMiddleware",
+    "tracer_from_env",
+]
 
 import json
 import queue
@@ -40,11 +60,11 @@ import sys
 import threading
 import time
 import traceback
+from collections.abc import Generator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Generator, Protocol
-
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Protocol
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -55,16 +75,54 @@ from typing import Generator, Protocol
 class Span:
     """A single tracing span.  Mutable so events can be appended in-place."""
 
-    trace_id: str           # 32 hex chars
-    span_id: str            # 16 hex chars
+    trace_id: str  # 32 hex chars
+    span_id: str  # 16 hex chars
     parent_span_id: str | None
     name: str
-    start_time_ns: int      # unix epoch nanoseconds
+    start_time_ns: int  # unix epoch nanoseconds
     end_time_ns: int | None
-    status: str             # "UNSET" | "OK" | "ERROR"
+    status: str  # "UNSET" | "OK" | "ERROR"
     attributes: dict[str, str | int | float | bool]
-    events: list[dict]      # {"name": str, "timestamp_ns": int, "attributes": dict}
-    kind: int = 1           # 1=INTERNAL, 2=SERVER, 3=CLIENT
+    events: list[dict]  # {"name": str, "timestamp_ns": int, "attributes": dict}
+    kind: int = 1  # 1=INTERNAL, 2=SERVER, 3=CLIENT
+
+    def finished(self) -> FinishedSpan:
+        """Create an immutable FinishedSpan from this span's current values.
+
+        If end_time_ns is None, sets it to the current time.
+        """
+        end_ns = self.end_time_ns if self.end_time_ns is not None else time.time_ns()
+        self.end_time_ns = end_ns
+        return FinishedSpan(
+            trace_id=self.trace_id,
+            span_id=self.span_id,
+            parent_span_id=self.parent_span_id,
+            name=self.name,
+            start_time_ns=self.start_time_ns,
+            end_time_ns=end_ns,
+            status=self.status,
+            attributes=self.attributes,
+            events=self.events,
+            kind=self.kind,
+        )
+
+
+@dataclass
+class FinishedSpan(Span):
+    """A completed, immutable span with a guaranteed end_time_ns."""
+
+    end_time_ns: int  # pyright: ignore[reportIncompatibleVariableOverride]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_frozen", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_frozen", False):
+            raise AttributeError(f"cannot set '{name}' on immutable FinishedSpan")
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError(f"cannot delete '{name}' on immutable FinishedSpan")
 
 
 # ---------------------------------------------------------------------------
@@ -76,9 +134,9 @@ class Span:
 class TraceparentHeader:
     """W3C Trace Context Level 2 traceparent header."""
 
-    trace_id: str       # 32 hex chars
-    parent_id: str      # 16 hex chars
-    trace_flags: int    # typically 0x01 for sampled
+    trace_id: str  # 32 hex chars
+    parent_id: str  # 16 hex chars
+    trace_flags: int  # typically 0x01 for sampled
 
     @classmethod
     def parse(cls, header: str) -> TraceparentHeader | None:
@@ -124,8 +182,19 @@ def _is_hex(s: str) -> bool:
 class Exporter(Protocol):
     """Protocol that every exporter must satisfy."""
 
-    def export(self, span: Span) -> None: ...
-    def shutdown(self) -> None: ...
+    def export(self, span: FinishedSpan) -> None:
+        """Export a finished span
+
+        Some implementations may, for example, batch spans before actually exporting.
+        """
+        ...
+
+    def shutdown(self) -> None:
+        """Clean shutdown
+
+        Might, for example, close database connections, flush buffers, etc.
+        """
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -136,12 +205,12 @@ class Exporter(Protocol):
 class ConsoleExporter:
     """Pretty-prints completed spans as indented JSON to stderr."""
 
-    def export(self, span: Span) -> None:
+    def export(self, span: FinishedSpan) -> None:
         """Write a single span to stderr as JSON."""
         duration_ms = (span.end_time_ns - span.start_time_ns) / 1_000_000
         record = {
             "timestamp": datetime.fromtimestamp(
-                span.start_time_ns / 1e9, tz=timezone.utc
+                span.start_time_ns / 1e9, tz=UTC
             ).isoformat(),
             "trace_id": span.trace_id,
             "span_id": span.span_id,
@@ -207,15 +276,22 @@ class HTTPExporter:
             service_name: Service name embedded in resource attributes.
             default_attributes: Extra resource attributes.
         """
-        import httpx  # late import keeps the module importable without httpx
+        try:
+            import httpx  # late import keeps the module importable without httpx
+        except ImportError:
+            raise ImportError(
+                "HTTPExporter requires httpx. Install picotel[http] to include it."
+            ) from None
 
         self.endpoint = endpoint
         self.batch_size = batch_size
         self.flush_interval_seconds = flush_interval_seconds
         self.service_name = service_name
-        self.default_attributes: dict[str, str | int | float | bool] = default_attributes or {}
+        self.default_attributes: dict[str, str | int | float | bool] = (
+            default_attributes or {}
+        )
 
-        self._queue: queue.Queue[Span] = queue.Queue()
+        self._queue: queue.Queue[FinishedSpan] = queue.Queue()
         self._stop_event = threading.Event()
 
         extra_headers = {"Content-Type": "application/json"}
@@ -233,7 +309,7 @@ class HTTPExporter:
         )
         self._thread.start()
 
-    def export(self, span: Span) -> None:
+    def export(self, span: FinishedSpan) -> None:
         """Enqueue a span for batched export.  Never blocks the caller."""
         self._queue.put_nowait(span)
 
@@ -256,7 +332,7 @@ class HTTPExporter:
 
     def _flush(self) -> None:
         """Drain the queue and POST in chunks of batch_size."""
-        batch: list[Span] = []
+        batch: list[FinishedSpan] = []
         while True:
             try:
                 batch.append(self._queue.get_nowait())
@@ -268,7 +344,7 @@ class HTTPExporter:
         if batch:
             self._post(batch)
 
-    def _post(self, spans: list[Span]) -> None:
+    def _post(self, spans: list[FinishedSpan]) -> None:
         body = self._serialize_batch(spans)
         try:
             resp = self._client.post(self.endpoint, content=json.dumps(body))
@@ -279,7 +355,7 @@ class HTTPExporter:
                 file=sys.stderr,
             )
 
-    def _serialize_batch(self, spans: list[Span]) -> dict:
+    def _serialize_batch(self, spans: list[FinishedSpan]) -> dict:
         """Convert a list of Span dataclasses into the OTLP/HTTP JSON structure."""
         resource_attrs: dict[str, str | int | float | bool] = {
             "service.name": self.service_name,
@@ -326,7 +402,7 @@ class HTTPExporter:
                     "resource": {"attributes": resource_attr_list},
                     "scopeSpans": [
                         {
-                            "scope": {"name": "picotel", "version": "0.1.0"},
+                            "scope": {"name": "picotel", "version": _VERSION},
                             "spans": otlp_spans,
                         }
                     ],
@@ -361,7 +437,9 @@ class Tracer:
         """
         self.service_name = service_name
         self.exporters = exporters
-        self.default_attributes: dict[str, str | int | float | bool] = default_attributes or {}
+        self.default_attributes: dict[str, str | int | float | bool] = (
+            default_attributes or {}
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -430,21 +508,22 @@ class Tracer:
         self,
         span: Span,
         exc_info: tuple | None = None,
-    ) -> None:
+    ) -> FinishedSpan:
         """Finish a span started with :meth:`start_span` and export it.
 
         Args:
             span: The span to finish.
             exc_info: Optional ``sys.exc_info()`` tuple if an error occurred.
         """
-        span.end_time_ns = time.time_ns()
+        end_ns = time.time_ns()
+        span.end_time_ns = end_ns
         if exc_info and exc_info[0] is not None:
             span.status = "ERROR"
             exc_type, exc_value, exc_tb = exc_info
             span.events.append(
                 {
                     "name": "exception",
-                    "timestamp_ns": span.end_time_ns,
+                    "timestamp_ns": end_ns,
                     "attributes": {
                         "exception.type": exc_type.__qualname__ if exc_type else "",
                         "exception.message": str(exc_value),
@@ -456,7 +535,9 @@ class Tracer:
             )
         else:
             span.status = "OK"
-        self._export(span)
+        finished = span.finished()
+        self._export(finished)
+        return finished
 
     def add_event(
         self,
@@ -506,7 +587,7 @@ class Tracer:
             return parent.trace_id, parent.parent_id
         return secrets.token_hex(16), None
 
-    def _export(self, span: Span) -> None:
+    def _export(self, span: FinishedSpan) -> None:
         for exporter in self.exporters:
             exporter.export(span)
 
@@ -575,8 +656,8 @@ class TracingMiddleware:
 
     def __init__(self, app, tracer: Tracer):
         """Args:
-            app: The ASGI application to wrap.
-            tracer: The Tracer instance created at startup.
+        app: The ASGI application to wrap.
+        tracer: The Tracer instance created at startup.
         """
         self.app = app
         self.tracer = tracer

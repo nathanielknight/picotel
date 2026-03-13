@@ -1,25 +1,23 @@
-"""Tests for tracing.py — uses red/green TDD with pytest and hypothesis."""
+"""Unit and generative tests for picotel."""
+
 from __future__ import annotations
 
 import json
-import sys
 import time
-import threading
-from io import StringIO
 from unittest.mock import MagicMock, patch
 
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from tracing import (
+from picotel import (
     ConsoleExporter,
+    FinishedSpan,
     HTTPExporter,
     Span,
-    Tracer,
     TraceparentHeader,
+    Tracer,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -30,9 +28,9 @@ class ListExporter:
     """Collects exported spans into a list for assertions."""
 
     def __init__(self):
-        self.spans: list[Span] = []
+        self.spans: list[FinishedSpan] = []
 
-    def export(self, span: Span) -> None:
+    def export(self, span: FinishedSpan) -> None:
         self.spans.append(span)
 
     def shutdown(self) -> None:
@@ -261,7 +259,7 @@ def test_otlp_serialization_structure():
     exporter.service_name = "svc"
     exporter.default_attributes = {}
 
-    span = Span(
+    span = FinishedSpan(
         trace_id="a" * 32,
         span_id="b" * 16,
         parent_span_id=None,
@@ -281,7 +279,7 @@ def test_otlp_serialization_structure():
     assert "scopeSpans" in rs
 
     scope_spans = rs["scopeSpans"][0]
-    assert scope_spans["scope"]["name"] == "tracing.py"
+    assert scope_spans["scope"]["name"] == "picotel"
 
     s = scope_spans["spans"][0]
     assert s["traceId"] == "a" * 32
@@ -298,7 +296,7 @@ def test_otlp_typed_attributes():
     exporter.service_name = "svc"
     exporter.default_attributes = {}
 
-    span = Span(
+    span = FinishedSpan(
         trace_id="a" * 32,
         span_id="b" * 16,
         parent_span_id=None,
@@ -327,7 +325,7 @@ def test_otlp_with_parent_span_id():
     exporter.service_name = "svc"
     exporter.default_attributes = {}
 
-    span = Span(
+    span = FinishedSpan(
         trace_id="a" * 32,
         span_id="b" * 16,
         parent_span_id="c" * 16,
@@ -349,7 +347,7 @@ def test_otlp_status_codes():
     exporter.default_attributes = {}
 
     for status, expected_code in [("UNSET", 0), ("OK", 1), ("ERROR", 2)]:
-        span = Span(
+        span = FinishedSpan(
             trace_id="a" * 32,
             span_id="b" * 16,
             parent_span_id=None,
@@ -362,7 +360,9 @@ def test_otlp_status_codes():
         )
         body = exporter._serialize_batch([span])
         code = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["status"]["code"]
-        assert code == expected_code, f"Expected {expected_code} for {status}, got {code}"
+        assert code == expected_code, (
+            f"Expected {expected_code} for {status}, got {code}"
+        )
 
 
 def test_otlp_nanoseconds_are_strings():
@@ -370,7 +370,7 @@ def test_otlp_nanoseconds_are_strings():
     exporter.service_name = "svc"
     exporter.default_attributes = {}
 
-    span = Span(
+    span = FinishedSpan(
         trace_id="a" * 32,
         span_id="b" * 16,
         parent_span_id=None,
@@ -401,7 +401,9 @@ def test_http_exporter_posts_spans(tmp_path):
     mock_response.raise_for_status = MagicMock()
 
     mock_client = MagicMock()
-    mock_client.post = MagicMock(side_effect=lambda *a, **kw: (posted.append(kw), mock_response)[1])
+    mock_client.post = MagicMock(
+        side_effect=lambda *a, **kw: (posted.append(kw), mock_response)[1]
+    )
 
     with patch("httpx.Client", return_value=mock_client):
         exporter = HTTPExporter(
@@ -453,7 +455,7 @@ def test_http_exporter_shutdown_flushes():
 
 def test_console_exporter_writes_json(capsys):
     exporter = ConsoleExporter()
-    span = Span(
+    span = FinishedSpan(
         trace_id="a" * 32,
         span_id="b" * 16,
         parent_span_id=None,
@@ -475,7 +477,7 @@ def test_console_exporter_writes_json(capsys):
 
 def test_console_exporter_drops_none_fields(capsys):
     exporter = ConsoleExporter()
-    span = Span(
+    span = FinishedSpan(
         trace_id="a" * 32,
         span_id="b" * 16,
         parent_span_id=None,
@@ -527,7 +529,7 @@ def test_default_attributes_in_serialization():
     exporter.service_name = "my-svc"
     exporter.default_attributes = {"env": "prod", "version": "1.0"}
 
-    span = Span(
+    span = FinishedSpan(
         trace_id="a" * 32,
         span_id="b" * 16,
         parent_span_id=None,
@@ -540,8 +542,7 @@ def test_default_attributes_in_serialization():
     )
     body = exporter._serialize_batch([span])
     resource_attrs = {
-        a["key"]: a["value"]
-        for a in body["resourceSpans"][0]["resource"]["attributes"]
+        a["key"]: a["value"] for a in body["resourceSpans"][0]["resource"]["attributes"]
     }
     assert resource_attrs["service.name"] == {"stringValue": "my-svc"}
     assert resource_attrs["env"] == {"stringValue": "prod"}
@@ -575,17 +576,103 @@ def test_start_finish_span_with_parent():
 
 
 # ---------------------------------------------------------------------------
+# 13. Span.finished() conversion
+# ---------------------------------------------------------------------------
+
+
+def test_span_finished_creates_finished_span():
+    span = Span(
+        trace_id="a" * 32,
+        span_id="b" * 16,
+        parent_span_id=None,
+        name="convert-me",
+        start_time_ns=1_000_000_000,
+        end_time_ns=2_000_000_000,
+        status="OK",
+        attributes={"key": "val"},
+        events=[],
+    )
+    finished = span.finished()
+    assert isinstance(finished, FinishedSpan)
+    assert finished.trace_id == span.trace_id
+    assert finished.span_id == span.span_id
+    assert finished.name == span.name
+    assert finished.end_time_ns == 2_000_000_000
+    assert finished.status == "OK"
+    assert finished.attributes == {"key": "val"}
+    assert finished.kind == span.kind
+
+
+def test_span_finished_sets_end_time_if_none():
+    before = time.time_ns()
+    span = Span(
+        trace_id="a" * 32,
+        span_id="b" * 16,
+        parent_span_id=None,
+        name="unfinished",
+        start_time_ns=1_000_000_000,
+        end_time_ns=None,
+        status="UNSET",
+        attributes={},
+        events=[],
+    )
+    finished = span.finished()
+    after = time.time_ns()
+    assert before <= finished.end_time_ns <= after
+    assert span.end_time_ns == finished.end_time_ns
+
+
+# ---------------------------------------------------------------------------
+# 14. FinishedSpan immutability
+# ---------------------------------------------------------------------------
+
+
+def test_finished_span_is_immutable():
+    finished = FinishedSpan(
+        trace_id="a" * 32,
+        span_id="b" * 16,
+        parent_span_id=None,
+        name="frozen",
+        start_time_ns=1_000_000_000,
+        end_time_ns=2_000_000_000,
+        status="OK",
+        attributes={},
+        events=[],
+    )
+    with pytest.raises(AttributeError, match="immutable FinishedSpan"):
+        finished.status = "ERROR"
+    with pytest.raises(AttributeError, match="immutable FinishedSpan"):
+        finished.end_time_ns = 999
+
+
+def test_finished_span_cannot_delete_attributes():
+    finished = FinishedSpan(
+        trace_id="a" * 32,
+        span_id="b" * 16,
+        parent_span_id=None,
+        name="frozen",
+        start_time_ns=1_000_000_000,
+        end_time_ns=2_000_000_000,
+        status="OK",
+        attributes={},
+        events=[],
+    )
+    with pytest.raises(AttributeError, match="immutable FinishedSpan"):
+        del finished.name
+
+
+# ---------------------------------------------------------------------------
 # Hypothesis property-based tests
 # ---------------------------------------------------------------------------
 
 
 @given(
-    trace_id=st.text(
-        alphabet="0123456789abcdef", min_size=32, max_size=32
-    ).filter(lambda x: x != "0" * 32),
-    parent_id=st.text(
-        alphabet="0123456789abcdef", min_size=16, max_size=16
-    ).filter(lambda x: x != "0" * 16),
+    trace_id=st.text(alphabet="0123456789abcdef", min_size=32, max_size=32).filter(
+        lambda x: x != "0" * 32
+    ),
+    parent_id=st.text(alphabet="0123456789abcdef", min_size=16, max_size=16).filter(
+        lambda x: x != "0" * 16
+    ),
     trace_flags=st.integers(min_value=0, max_value=255),
 )
 def test_traceparent_roundtrip(trace_id, parent_id, trace_flags):
@@ -630,3 +717,165 @@ def test_span_creation_with_arbitrary_inputs(name, attrs):
         pass
     assert len(exporter.spans) == 1
     assert exporter.spans[0].name == name
+
+
+# Shared strategy for valid span attribute values.
+_attr_values = st.one_of(
+    st.text(max_size=50),
+    st.integers(),
+    st.floats(allow_nan=False, allow_infinity=False),
+    st.booleans(),
+)
+_attrs = st.dictionaries(st.text(min_size=1, max_size=20), _attr_values, max_size=5)
+
+
+@given(st.lists(st.text(min_size=1, max_size=50), min_size=1, max_size=6))
+@settings(max_examples=40)
+def test_nested_spans_parent_relationships(names):
+    """State machine: build a chain of nested spans, verify trace/parent IDs."""
+    tracer, exporter = make_tracer()
+
+    # Build a nested chain programmatically (start_span / finish_span so we
+    # can control nesting depth without recursive context managers).
+    spans: list[Span] = []
+    for name in names:
+        parent = spans[-1] if spans else None
+        spans.append(tracer.start_span(name, parent=parent))
+    for span in reversed(spans):
+        tracer.finish_span(span)
+
+    root_trace_id = spans[0].trace_id
+    span_ids = [s.span_id for s in spans]
+
+    for i, span in enumerate(spans):
+        # All spans share the same trace_id.
+        assert span.trace_id == root_trace_id
+        # Root has no parent; all others point at the previous span.
+        if i == 0:
+            assert span.parent_span_id is None
+        else:
+            assert span.parent_span_id == spans[i - 1].span_id
+
+    # All span_ids are unique.
+    assert len(span_ids) == len(set(span_ids))
+
+
+@given(st.text(min_size=1, max_size=100))
+@settings(max_examples=50)
+def test_span_timing_invariant(name):
+    """start_time_ns <= end_time_ns for every finished span."""
+    tracer, exporter = make_tracer()
+    with tracer.span(name):
+        pass
+    s = exporter.spans[0]
+    assert s.start_time_ns <= s.end_time_ns
+
+
+@given(_attrs)
+@settings(max_examples=50)
+def test_otlp_serialization_is_valid_json_with_required_structure(attrs):
+    """Arbitrary attributes produce valid OTLP JSON with the required keys."""
+    exporter = HTTPExporter.__new__(HTTPExporter)
+    exporter.service_name = "prop-test"
+    exporter.default_attributes = {}
+
+    span = FinishedSpan(
+        trace_id="a" * 32,
+        span_id="b" * 16,
+        parent_span_id=None,
+        name="s",
+        start_time_ns=1_000_000_000,
+        end_time_ns=2_000_000_000,
+        status="OK",
+        attributes=attrs,
+        events=[],
+    )
+    body = exporter._serialize_batch([span])
+
+    # Must be serialisable to JSON without error.
+    raw = json.dumps(body)
+    parsed = json.loads(raw)
+
+    # Required OTLP structure.
+    rs = parsed["resourceSpans"][0]
+    assert "resource" in rs
+    scope_span = rs["scopeSpans"][0]["spans"][0]
+    assert scope_span["traceId"] == "a" * 32
+    assert isinstance(scope_span["startTimeUnixNano"], str)
+    assert isinstance(scope_span["endTimeUnixNano"], str)
+
+
+@given(_attrs)
+@settings(max_examples=50)
+def test_otlp_attribute_types_are_preserved(attrs):
+    """Each Python type maps to the correct OTLP typed value wrapper."""
+    exporter = HTTPExporter.__new__(HTTPExporter)
+    exporter.service_name = "prop-test"
+    exporter.default_attributes = {}
+
+    span = FinishedSpan(
+        trace_id="a" * 32,
+        span_id="b" * 16,
+        parent_span_id=None,
+        name="s",
+        start_time_ns=1,
+        end_time_ns=2,
+        status="OK",
+        attributes=attrs,
+        events=[],
+    )
+    body = exporter._serialize_batch([span])
+    otlp_attrs = {
+        a["key"]: a["value"]
+        for a in body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+    }
+
+    for key, value in attrs.items():
+        typed = otlp_attrs[key]
+        if isinstance(value, bool):
+            assert "boolValue" in typed
+            assert typed["boolValue"] == value
+        elif isinstance(value, int):
+            assert "intValue" in typed
+            assert typed["intValue"] == str(value)
+        elif isinstance(value, float):
+            assert "doubleValue" in typed
+        else:
+            assert "stringValue" in typed
+
+
+@given(st.text(min_size=1, max_size=100), _attrs)
+@settings(max_examples=40)
+def test_traceparent_for_always_parseable(name, attrs):
+    """traceparent_for() always returns a header that parses back correctly."""
+    tracer, exporter = make_tracer()
+    with tracer.span(name, attributes=attrs) as span:
+        header = tracer.traceparent_for(span)
+
+    tp = TraceparentHeader.parse(header)
+    assert tp is not None
+    assert tp.trace_id == span.trace_id
+    assert tp.parent_id == span.span_id
+
+
+@given(
+    st.text(min_size=1, max_size=50),
+    st.text(min_size=0, max_size=100),
+)
+@settings(max_examples=40)
+def test_exception_spans_always_have_error_event(exc_type_name, exc_message):
+    """Any exception produces status=ERROR and exactly one exception event."""
+    tracer, exporter = make_tracer()
+    error = ValueError(exc_message)
+    with pytest.raises(ValueError):
+        with tracer.span("failing"):
+            raise error
+
+    finished = exporter.spans[0]
+    assert finished.status == "ERROR"
+    assert len(finished.events) == 1
+    event = finished.events[0]
+    assert event["name"] == "exception"
+    assert "exception.type" in event["attributes"]
+    assert "exception.message" in event["attributes"]
+    assert "exception.stacktrace" in event["attributes"]
