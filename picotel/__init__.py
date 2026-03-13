@@ -24,16 +24,18 @@ from __future__ import annotations
 try:
     from importlib.metadata import version as _pkg_version
 
-    _VERSION = _pkg_version("picotel")
+    __version__ = _pkg_version("picotel")
 except Exception:
-    _VERSION = "unknown"
+    __version__ = "unknown"
 
 __all__ = [
     "Span",
+    "SpanKind",
     "ConsoleExporter",
     "HTTPExporter",
     "Tracer",
     "tracer_from_env",
+    "__version__",
 ]
 
 import copy
@@ -60,6 +62,19 @@ _AttrValue = str | int | float | bool
 _Attributes = dict[str, _AttrValue]
 
 # ---------------------------------------------------------------------------
+# Span kind constants
+# ---------------------------------------------------------------------------
+
+
+class SpanKind:
+    """Constants for span kind classification per OpenTelemetry spec."""
+
+    INTERNAL = 1
+    SERVER = 2
+    CLIENT = 3
+
+
+# ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
 
@@ -83,7 +98,7 @@ class Span:
     status: str  # "UNSET" | "OK" | "ERROR"
     attributes: _Attributes
     events: list[dict[str, Any]]
-    kind: int = 1  # 1=INTERNAL, 2=SERVER, 3=CLIENT
+    kind: int = SpanKind.INTERNAL
     _tracer: Tracer | None = dataclasses.field(default=None, repr=False, compare=False)
     _finished: bool = dataclasses.field(default=False, repr=False, compare=False)
 
@@ -112,7 +127,7 @@ class Span:
         self,
         name: str,
         attributes: _Attributes | None = None,
-        kind: int = 1,
+        kind: int = SpanKind.INTERNAL,
     ) -> _SubspanContext:
         """Create a child span whose parent is this span.
 
@@ -242,7 +257,7 @@ class FinishedSpan:
     status: str  # "OK" | "ERROR"
     attributes: _Attributes
     events: list[dict[str, Any]]
-    kind: int = 1  # 1=INTERNAL, 2=SERVER, 3=CLIENT
+    kind: int = SpanKind.INTERNAL
 
 
 # ---------------------------------------------------------------------------
@@ -554,7 +569,7 @@ class HTTPExporter:
                         {
                             "scope": {
                                 "name": "picotel",
-                                "version": _VERSION,
+                                "version": __version__,
                             },
                             "spans": otlp_spans,
                         }
