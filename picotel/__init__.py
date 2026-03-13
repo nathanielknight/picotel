@@ -105,7 +105,7 @@ class Span:
             {
                 "name": name,
                 "timestamp_ns": time.time_ns(),
-                "attributes": attributes or {},
+                "attributes": copy.deepcopy(attributes) if attributes else {},
             }
         )
 
@@ -186,7 +186,7 @@ class Span:
                     },
                 }
             )
-        else:
+        elif self.status == "UNSET":
             self.status = "OK"
         finished = self._to_finished()
         self._tracer._export(finished)
@@ -573,7 +573,10 @@ class HTTPExporter:
 class Tracer:
     """Entry point for creating and exporting spans.
 
-    Not a singleton — instantiate explicitly and pass it around.
+    Not a singleton — instantiate explicitly and pass it around.  However,
+    because :class:`HTTPExporter` starts a background thread, you should
+    typically create one ``Tracer`` instance for the lifetime of your
+    application rather than creating them in a loop.
 
     The ``service_name`` and ``default_attributes`` are forwarded to any
     :class:`HTTPExporter` in *exporters* so the OTLP resource block is
@@ -635,7 +638,7 @@ class Tracer:
         exc_info: _ExcInfo | None = None
         try:
             yield s
-        except Exception:
+        except BaseException:
             exc_info = sys.exc_info()  # type: ignore[assignment]
             raise
         finally:
@@ -808,6 +811,13 @@ class TracingMiddleware:
             "http.url": path,
         }
 
+        # Extra metadata if available
+        if "client" in scope and scope["client"]:
+            attrs["client.address"] = str(scope["client"][0])
+        user_agent = headers.get(b"user-agent", b"").decode("latin-1")
+        if user_agent:
+            attrs["user_agent.original"] = user_agent
+
         span = self._tracer.start_span(
             name=f"{method} {path}",
             parent=parent,
@@ -828,7 +838,7 @@ class TracingMiddleware:
         exc_info: _ExcInfo | None = None
         try:
             await self._app(scope, receive, send_wrapper)
-        except Exception:
+        except BaseException:
             exc_info = sys.exc_info()  # type: ignore[assignment]
             raise
         finally:

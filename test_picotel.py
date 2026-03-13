@@ -739,6 +739,15 @@ def test_finish_without_tracer_raises():
         span.finish()
 
 
+def test_manual_status_preserved_on_finish():
+    """Manually setting span.status before finish() is respected."""
+    tracer, exporter = make_tracer()
+    span = tracer.start_span("manual-status")
+    span.status = "ERROR"
+    span.finish()
+    assert exporter.spans[0].status == "ERROR"
+
+
 # ---------------------------------------------------------------------------
 # 12b. Double-finish guard
 # ---------------------------------------------------------------------------
@@ -999,7 +1008,8 @@ def test_middleware_creates_span_for_http_request():
         "type": "http",
         "method": "GET",
         "path": "/api/users",
-        "headers": [],
+        "headers": [(b"user-agent", b"test-agent")],
+        "client": ("127.0.0.1", 1234),
     }
 
     sent_messages: list = []
@@ -1020,6 +1030,9 @@ def test_middleware_creates_span_for_http_request():
     assert span.attributes["http.route"] == "/api/users"
     assert span.attributes["http.status_code"] == 200
     assert span.kind == 2  # SERVER
+    assert "client.address" in span.attributes
+    assert span.attributes["client.address"] == "127.0.0.1"
+    assert span.attributes["user_agent.original"] == "test-agent"
 
 
 def test_middleware_propagates_traceparent():
