@@ -42,16 +42,15 @@ __all__ = [
 import copy
 import dataclasses
 import json
-import queue
 import secrets
 import sys
-import threading
 import time
 import traceback
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import IntEnum
 from types import TracebackType
 from typing import Any, Protocol
 
@@ -67,8 +66,12 @@ _Attributes = dict[str, _AttrValue]
 # ---------------------------------------------------------------------------
 
 
-class SpanKind:
-    """Constants for span kind classification per OpenTelemetry spec."""
+class SpanKind(IntEnum):
+    """Span kind classification per OpenTelemetry spec.
+
+    Uses :class:`IntEnum` so values are plain ints in serialization
+    but invalid literals are rejected at construction time.
+    """
 
     INTERNAL = 1
     SERVER = 2
@@ -354,12 +357,19 @@ class TraceparentHeader:
         return f"00-{self.trace_id}-{self.parent_id}-{self.trace_flags:02x}"
 
 
+def _narrow_exc_info() -> _ExcInfo | None:
+    """Return ``sys.exc_info()`` narrowed to ``_ExcInfo`` or ``None``."""
+    exc_type, exc_value, exc_tb = sys.exc_info()
+    if exc_type is not None and exc_value is not None and exc_tb is not None:
+        return (exc_type, exc_value, exc_tb)
+    return None
+
+
+_HEX_CHARS = set("0123456789abcdef")
+
+
 def _is_hex(s: str) -> bool:
-    try:
-        int(s, 16)
-        return True
-    except ValueError:
-        return False
+    return all(c in _HEX_CHARS for c in s)
 
 
 # ---------------------------------------------------------------------------
@@ -380,9 +390,7 @@ class ResourceInfo:
     default_attributes: _Attributes
 
     def __hash__(self) -> int:
-        return hash(
-            (self.service_name, tuple(sorted(self.default_attributes.items())))
-        )
+        return hash((self.service_name, tuple(sorted(self.default_attributes.items()))))
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, ResourceInfo):
@@ -420,9 +428,7 @@ class ConsoleExporter:
             ).isoformat(),
             "service_name": resource.service_name,
             "resource_attributes": (
-                resource.default_attributes
-                if resource.default_attributes
-                else None
+                resource.default_attributes if resource.default_attributes else None
             ),
             "trace_id": span.trace_id,
             "span_id": span.span_id,
@@ -479,6 +485,9 @@ class HTTPExporter:
         timeout_seconds: float = 10.0,
         headers: dict[str, str] | None = None,
     ):
+        import queue as _queue_mod
+        import threading as _threading_mod
+
         try:
             import httpx
         except ImportError:
@@ -489,9 +498,13 @@ class HTTPExporter:
         self._endpoint = endpoint
         self._batch_size = batch_size
         self._flush_interval_seconds = flush_interval_seconds
+        self._queue_mod = _queue_mod
 
-        self._queue: queue.Queue[tuple[FinishedSpan, ResourceInfo]] = queue.Queue()
-        self._stop_event = threading.Event()
+        self._queue: _queue_mod.Queue[tuple[FinishedSpan, ResourceInfo]] = (
+            _queue_mod.Queue()
+        )
+        self._stop_event = _threading_mod.Event()
+        self._lock = _threading_mod.Lock()
 
         extra_headers = {"Content-Type": "application/json"}
         if headers:
@@ -501,14 +514,12 @@ class HTTPExporter:
             timeout=timeout_seconds,
         )
 
-        self._thread = threading.Thread(
+        self._thread = _threading_mod.Thread(
             target=self._run,
             daemon=True,
             name="picotel-http-exporter",
         )
         self._thread.start()
-
-
 
     def export(self, span: FinishedSpan, resource: ResourceInfo) -> None:
         """Enqueue a span for batched export.  Never blocks the caller."""
@@ -518,12 +529,11 @@ class HTTPExporter:
         """Flush remaining spans and stop the background thread."""
         self._stop_event.set()
         self._thread.join(timeout=30)
-        if not self._thread.is_alive():
-            # Thread exited cleanly — drain anything left in the queue.
-            self._flush()
-        # If the thread is still alive after the join timeout, skip the
-        # extra flush to avoid racing with the still-running thread.
-        self._client.close()
+        with self._lock:
+            if not self._thread.is_alive():
+                # Thread exited cleanly — drain anything left in the queue.
+                self._flush()
+            self._client.close()
 
     # ------------------------------------------------------------------
     # Internal
@@ -532,14 +542,15 @@ class HTTPExporter:
     def _run(self) -> None:
         while not self._stop_event.is_set():
             self._stop_event.wait(timeout=self._flush_interval_seconds)
-            self._flush()
+            with self._lock:
+                self._flush()
 
     def _flush(self) -> None:
         batch: list[tuple[FinishedSpan, ResourceInfo]] = []
         while True:
             try:
                 batch.append(self._queue.get_nowait())
-            except queue.Empty:
+            except self._queue_mod.Empty:
                 break
             if len(batch) >= self._batch_size:
                 self._post(batch)
@@ -565,15 +576,14 @@ class HTTPExporter:
         # Group by resource so spans from different tracers get
         # separate resourceSpans entries.  In practice there is
         # usually only one resource per batch.
-        by_resource: dict[str, tuple[ResourceInfo, list[FinishedSpan]]] = {}
+        by_resource: dict[ResourceInfo, list[FinishedSpan]] = {}
         for span, resource in items:
-            key = resource.service_name
-            if key not in by_resource:
-                by_resource[key] = (resource, [])
-            by_resource[key][1].append(span)
+            if resource not in by_resource:
+                by_resource[resource] = []
+            by_resource[resource].append(span)
 
         resource_spans_list: list[dict[str, Any]] = []
-        for resource, spans in by_resource.values():
+        for resource, spans in by_resource.items():
             resource_spans_list.append(
                 HTTPExporter._serialize_resource_spans(resource, spans)
             )
@@ -694,7 +704,7 @@ class Tracer:
         name: str,
         parent: Span | TraceparentHeader | None = None,
         attributes: _Attributes | None = None,
-        kind: int = 1,
+        kind: int = SpanKind.INTERNAL,
     ) -> Generator[Span, None, None]:
         """Context manager that creates, yields, and finishes a span.
 
@@ -713,7 +723,7 @@ class Tracer:
         try:
             yield s
         except BaseException:
-            exc_info = sys.exc_info()  # type: ignore[assignment]
+            exc_info = _narrow_exc_info()
             raise
         finally:
             s.finish(exc_info=exc_info)
@@ -723,7 +733,7 @@ class Tracer:
         name: str,
         parent: Span | TraceparentHeader | None = None,
         attributes: _Attributes | None = None,
-        kind: int = 1,
+        kind: int = SpanKind.INTERNAL,
     ) -> Span:
         """Create and return a new in-progress span.
 
@@ -785,7 +795,6 @@ class Tracer:
                     f" failed for span {span.name!r}: {exc}",
                     file=sys.stderr,
                 )
-
 
 
 # ---------------------------------------------------------------------------
