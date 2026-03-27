@@ -33,6 +33,7 @@ __all__ = [
     "SpanKind",
     "ConsoleExporter",
     "HTTPExporter",
+    "ResourceInfo",
     "Tracer",
     "tracer_from_env",
     "__version__",
@@ -366,10 +367,36 @@ def _is_hex(s: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class ResourceInfo:
+    """Immutable resource metadata passed to exporters with each span.
+
+    Carries the ``service.name`` and any default attributes configured
+    on the :class:`Tracer`.  Exporters receive this at export time
+    rather than storing it as mutable instance state.
+    """
+
+    service_name: str
+    default_attributes: _Attributes
+
+    def __hash__(self) -> int:
+        return hash(
+            (self.service_name, tuple(sorted(self.default_attributes.items())))
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ResourceInfo):
+            return NotImplemented
+        return (
+            self.service_name == other.service_name
+            and self.default_attributes == other.default_attributes
+        )
+
+
 class _Exporter(Protocol):
     """Protocol that every exporter must satisfy."""
 
-    def export(self, span: FinishedSpan) -> None: ...
+    def export(self, span: FinishedSpan, resource: ResourceInfo) -> None: ...
 
     def shutdown(self) -> None: ...
 
@@ -382,13 +409,21 @@ class _Exporter(Protocol):
 class ConsoleExporter:
     """Prints completed spans as JSON to stderr."""
 
-    def export(self, span: FinishedSpan) -> None:
+    def export(self, span: FinishedSpan, resource: ResourceInfo) -> None:
         """Write a single span to stderr as JSON."""
         duration_ms = (span.end_time_ns - span.start_time_ns) / 1_000_000
+        # NOTE: We set empty collections to None so that they don't
+        # get serialized.
         record: dict[str, object] = {
             "timestamp": datetime.fromtimestamp(
                 span.start_time_ns / 1e9, tz=UTC
             ).isoformat(),
+            "service_name": resource.service_name,
+            "resource_attributes": (
+                resource.default_attributes
+                if resource.default_attributes
+                else None
+            ),
             "trace_id": span.trace_id,
             "span_id": span.span_id,
             "parent_span_id": span.parent_span_id,
@@ -455,7 +490,7 @@ class HTTPExporter:
         self._batch_size = batch_size
         self._flush_interval_seconds = flush_interval_seconds
 
-        self._queue: queue.Queue[FinishedSpan] = queue.Queue()
+        self._queue: queue.Queue[tuple[FinishedSpan, ResourceInfo]] = queue.Queue()
         self._stop_event = threading.Event()
 
         extra_headers = {"Content-Type": "application/json"}
@@ -473,19 +508,21 @@ class HTTPExporter:
         )
         self._thread.start()
 
-        # Set by Tracer._attach_exporters() before any spans are exported.
-        self._service_name: str = "unknown-service"
-        self._default_attributes: _Attributes = {}
 
-    def export(self, span: FinishedSpan) -> None:
+
+    def export(self, span: FinishedSpan, resource: ResourceInfo) -> None:
         """Enqueue a span for batched export.  Never blocks the caller."""
-        self._queue.put_nowait(span)
+        self._queue.put_nowait((span, resource))
 
     def shutdown(self) -> None:
         """Flush remaining spans and stop the background thread."""
         self._stop_event.set()
         self._thread.join(timeout=30)
-        self._flush()
+        if not self._thread.is_alive():
+            # Thread exited cleanly — drain anything left in the queue.
+            self._flush()
+        # If the thread is still alive after the join timeout, skip the
+        # extra flush to avoid racing with the still-running thread.
         self._client.close()
 
     # ------------------------------------------------------------------
@@ -498,7 +535,7 @@ class HTTPExporter:
             self._flush()
 
     def _flush(self) -> None:
-        batch: list[FinishedSpan] = []
+        batch: list[tuple[FinishedSpan, ResourceInfo]] = []
         while True:
             try:
                 batch.append(self._queue.get_nowait())
@@ -510,27 +547,51 @@ class HTTPExporter:
         if batch:
             self._post(batch)
 
-    def _post(self, spans: list[FinishedSpan]) -> None:
-        body = self._serialize_batch(spans)
+    def _post(self, items: list[tuple[FinishedSpan, ResourceInfo]]) -> None:
+        body = self._serialize_batch(items)
         try:
             resp = self._client.post(self._endpoint, content=json.dumps(body))
             resp.raise_for_status()
         except Exception as exc:
             print(
-                f"[picotel] WARNING: failed to export {len(spans)} spans: {exc}",
+                f"[picotel] WARNING: failed to export {len(items)} spans: {exc}",
                 file=sys.stderr,
             )
 
-    def _serialize_batch(self, spans: list[FinishedSpan]) -> dict[str, Any]:
+    @staticmethod
+    def _serialize_batch(
+        items: list[tuple[FinishedSpan, ResourceInfo]],
+    ) -> dict[str, Any]:
+        # Group by resource so spans from different tracers get
+        # separate resourceSpans entries.  In practice there is
+        # usually only one resource per batch.
+        by_resource: dict[str, tuple[ResourceInfo, list[FinishedSpan]]] = {}
+        for span, resource in items:
+            key = resource.service_name
+            if key not in by_resource:
+                by_resource[key] = (resource, [])
+            by_resource[key][1].append(span)
+
+        resource_spans_list: list[dict[str, Any]] = []
+        for resource, spans in by_resource.values():
+            resource_spans_list.append(
+                HTTPExporter._serialize_resource_spans(resource, spans)
+            )
+        return {"resourceSpans": resource_spans_list}
+
+    @staticmethod
+    def _serialize_resource_spans(
+        resource: ResourceInfo, spans: list[FinishedSpan]
+    ) -> dict[str, Any]:
         resource_attrs: _Attributes = {
-            "service.name": self._service_name,
-            **self._default_attributes,
+            "service.name": resource.service_name,
+            **resource.default_attributes,
         }
         resource_attr_list = [
             {"key": k, "value": _attr_value(v)} for k, v in resource_attrs.items()
         ]
 
-        otlp_spans = []
+        otlp_spans: list[dict[str, Any]] = []
         for s in spans:
             span_attrs = [
                 {"key": k, "value": _attr_value(v)} for k, v in s.attributes.items()
@@ -562,20 +623,16 @@ class HTTPExporter:
             )
 
         return {
-            "resourceSpans": [
+            "resource": {"attributes": resource_attr_list},
+            "scopeSpans": [
                 {
-                    "resource": {"attributes": resource_attr_list},
-                    "scopeSpans": [
-                        {
-                            "scope": {
-                                "name": "picotel",
-                                "version": __version__,
-                            },
-                            "spans": otlp_spans,
-                        }
-                    ],
+                    "scope": {
+                        "name": "picotel",
+                        "version": __version__,
+                    },
+                    "spans": otlp_spans,
                 }
-            ]
+            ],
         }
 
 
@@ -622,7 +679,10 @@ class Tracer:
         self._service_name = service_name
         self._exporters = exporters
         self._default_attributes: _Attributes = default_attributes or {}
-        self._attach_exporters()
+        self._resource = ResourceInfo(
+            service_name=service_name,
+            default_attributes=self._default_attributes,
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -717,14 +777,15 @@ class Tracer:
 
     def _export(self, span: FinishedSpan) -> None:
         for exporter in self._exporters:
-            exporter.export(span)
+            try:
+                exporter.export(span, self._resource)
+            except Exception as exc:
+                print(
+                    f"[picotel] WARNING: exporter {type(exporter).__name__}"
+                    f" failed for span {span.name!r}: {exc}",
+                    file=sys.stderr,
+                )
 
-    def _attach_exporters(self) -> None:
-        """Forward service_name / default_attributes to HTTP exporters."""
-        for exporter in self._exporters:
-            if isinstance(exporter, HTTPExporter):
-                exporter._service_name = self._service_name
-                exporter._default_attributes = dict(self._default_attributes)
 
 
 # ---------------------------------------------------------------------------
