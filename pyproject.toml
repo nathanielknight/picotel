@@ -1,0 +1,48 @@
+[project]
+name = "picotel"
+version = "0.1.0"
+description = "Deliberately minimal OpenTelemetry-compatible tracing for Python"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+authors = [
+    { name = "Nat Knight" }
+]
+
+[project.optional-dependencies]
+http = ["httpx>=0.27"]
+
+[project.urls]
+homepage = "https://github.com/nathanielknight/picotel"
+source = "https://github.com/nathanielknight/picotel"
+issues = "https://github.com/nathanielknight/picotel/issues"
+repository = "https://github.com/nathanielknight/picotel"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.27",
+    "pdoc>=14",
+    "pytest>=8.0",
+    "hypothesis>=6.100",
+    "ruff>=0.9",
+    "basedpyright>=1.18",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.basedpyright]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
