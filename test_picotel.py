@@ -18,6 +18,7 @@ from picotel import (
     ConsoleExporter,
     FinishedSpan,
     HTTPExporter,
+    ResourceInfo,
     Span,
     TraceparentHeader,
     Tracer,
@@ -35,7 +36,7 @@ class ListExporter:
     def __init__(self):
         self.spans: list[FinishedSpan] = []
 
-    def export(self, span: FinishedSpan) -> None:
+    def export(self, span: FinishedSpan, resource: ResourceInfo) -> None:
         self.spans.append(span)
 
     def shutdown(self) -> None:
@@ -69,15 +70,20 @@ def _make_finished(**overrides) -> FinishedSpan:
     return FinishedSpan(**defaults)
 
 
-def _make_http_serializer(
+_DEFAULT_RESOURCE = ResourceInfo(
+    service_name="svc",
+    default_attributes={},
+)
+
+
+def _make_resource(
     service_name: str = "svc",
     default_attributes: dict | None = None,
-) -> HTTPExporter:
-    """Create an HTTPExporter suitable for calling _serialize_batch only."""
-    exporter = HTTPExporter.__new__(HTTPExporter)
-    exporter._service_name = service_name
-    exporter._default_attributes = default_attributes or {}
-    return exporter
+) -> ResourceInfo:
+    return ResourceInfo(
+        service_name=service_name,
+        default_attributes=default_attributes or {},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +92,7 @@ def _make_http_serializer(
 
 
 def test_basic_span_creates_ids():
-    tracer, exporter = make_tracer()
+    tracer, _ = make_tracer()
     with tracer.span("my-op") as span:
         assert len(span.trace_id) == 32
         assert all(c in "0123456789abcdef" for c in span.trace_id)
@@ -95,7 +101,7 @@ def test_basic_span_creates_ids():
 
 
 def test_basic_span_timing():
-    tracer, exporter = make_tracer()
+    tracer, _ = make_tracer()
     before = time.time_ns()
     with tracer.span("timed") as span:
         assert span.start_time_ns >= before
@@ -121,7 +127,7 @@ def test_basic_span_status_ok():
 
 
 def test_span_no_parent():
-    tracer, exporter = make_tracer()
+    tracer, _ = make_tracer()
     with tracer.span("root") as span:
         pass
     assert span.parent_span_id is None
@@ -133,7 +139,7 @@ def test_span_no_parent():
 
 
 def test_child_inherits_trace_id():
-    tracer, exporter = make_tracer()
+    tracer, _ = make_tracer()
     with tracer.span("parent") as parent:
         with tracer.span("child", parent=parent) as child:
             pass
@@ -141,7 +147,7 @@ def test_child_inherits_trace_id():
 
 
 def test_child_has_correct_parent_span_id():
-    tracer, exporter = make_tracer()
+    tracer, _ = make_tracer()
     with tracer.span("parent") as parent:
         with tracer.span("child", parent=parent) as child:
             pass
@@ -149,7 +155,7 @@ def test_child_has_correct_parent_span_id():
 
 
 def test_child_has_different_span_id():
-    tracer, exporter = make_tracer()
+    tracer, _ = make_tracer()
     with tracer.span("parent") as parent:
         with tracer.span("child", parent=parent) as child:
             pass
@@ -174,21 +180,21 @@ def test_subspan_context_manager():
 
 
 def test_subspan_inherits_trace_id():
-    tracer, exporter = make_tracer()
+    tracer, _ = make_tracer()
     with tracer.span("parent") as parent:
         with parent.subspan("child") as child:
             assert child.trace_id == parent.trace_id
 
 
 def test_subspan_sets_parent_span_id():
-    tracer, exporter = make_tracer()
+    tracer, _ = make_tracer()
     with tracer.span("parent") as parent:
         with parent.subspan("child") as child:
             assert child.parent_span_id == parent.span_id
 
 
 def test_subspan_has_unique_span_id():
-    tracer, exporter = make_tracer()
+    tracer, _ = make_tracer()
     with tracer.span("parent") as parent:
         with parent.subspan("child") as child:
             assert child.span_id != parent.span_id
@@ -364,7 +370,7 @@ def test_traceparent_encode():
 
 
 def test_traceparent_for_span():
-    tracer, exporter = make_tracer()
+    tracer, _ = make_tracer()
     with tracer.span("root") as span:
         header = span.traceparent()
     assert header == f"00-{span.trace_id}-{span.span_id}-01"
@@ -379,7 +385,7 @@ def test_traceparent_for_span():
 
 
 def test_span_with_traceparent_parent():
-    tracer, exporter = make_tracer()
+    tracer, _ = make_tracer()
     tp = TraceparentHeader(
         trace_id="4bf92f3577b34da6a3ce929d0e0e4736",
         parent_id="00f067aa0ba902b7",
@@ -421,7 +427,7 @@ def test_exception_records_event():
 
 
 def test_exception_is_reraised():
-    tracer, exporter = make_tracer()
+    tracer, _ = make_tracer()
     with pytest.raises(KeyError):
         with tracer.span("re-raise"):
             raise KeyError("key")
@@ -441,13 +447,13 @@ def test_exception_span_has_end_time():
 
 
 def test_otlp_serialization_structure():
-    exporter = _make_http_serializer()
+    resource = _make_resource()
 
     span = _make_finished(
         attributes={"key": "val", "count": 1, "rate": 1.5, "flag": True},
     )
 
-    body = exporter._serialize_batch([span])
+    body = HTTPExporter._serialize_batch([(span, resource)])
 
     assert "resourceSpans" in body
     rs = body["resourceSpans"][0]
@@ -468,13 +474,13 @@ def test_otlp_serialization_structure():
 
 
 def test_otlp_typed_attributes():
-    exporter = _make_http_serializer()
+    resource = _make_resource()
 
     span = _make_finished(
         attributes={"s": "hello", "i": 42, "f": 3.14, "b": True},
     )
 
-    body = exporter._serialize_batch([span])
+    body = HTTPExporter._serialize_batch([(span, resource)])
     attrs = {
         a["key"]: a["value"]
         for a in body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
@@ -487,19 +493,19 @@ def test_otlp_typed_attributes():
 
 
 def test_otlp_with_parent_span_id():
-    exporter = _make_http_serializer()
+    resource = _make_resource()
 
     span = _make_finished(
         parent_span_id="c" * 16,
         name="child",
     )
-    body = exporter._serialize_batch([span])
+    body = HTTPExporter._serialize_batch([(span, resource)])
     s = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
     assert s["parentSpanId"] == "c" * 16
 
 
 def test_otlp_status_codes():
-    exporter = _make_http_serializer()
+    resource = _make_resource()
 
     for status, expected_code in [("UNSET", 0), ("OK", 1), ("ERROR", 2)]:
         span = _make_finished(
@@ -507,7 +513,7 @@ def test_otlp_status_codes():
             end_time_ns=2,
             status=status,
         )
-        body = exporter._serialize_batch([span])
+        body = HTTPExporter._serialize_batch([(span, resource)])
         code = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["status"]["code"]
         assert code == expected_code, (
             f"Expected {expected_code} for {status}, got {code}"
@@ -515,13 +521,13 @@ def test_otlp_status_codes():
 
 
 def test_otlp_nanoseconds_are_strings():
-    exporter = _make_http_serializer()
+    resource = _make_resource()
 
     span = _make_finished(
         start_time_ns=123456789,
         end_time_ns=987654321,
     )
-    body = exporter._serialize_batch([span])
+    body = HTTPExporter._serialize_batch([(span, resource)])
     s = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
     assert isinstance(s["startTimeUnixNano"], str)
     assert isinstance(s["endTimeUnixNano"], str)
@@ -630,7 +636,7 @@ def test_console_exporter_writes_json(capsys):
         end_time_ns=1_001_000_000,
         attributes={"foo": "bar"},
     )
-    exporter.export(span)
+    exporter.export(span, _DEFAULT_RESOURCE)
     captured = capsys.readouterr()
     data = json.loads(captured.err)
     assert data["name"] == "console-test"
@@ -642,7 +648,7 @@ def test_console_exporter_writes_json(capsys):
 def test_console_exporter_drops_none_fields(capsys):
     exporter = ConsoleExporter()
     span = _make_finished(name="no-parent")
-    exporter.export(span)
+    exporter.export(span, _DEFAULT_RESOURCE)
     captured = capsys.readouterr()
     data = json.loads(captured.err)
     assert "parent_span_id" not in data
@@ -679,13 +685,13 @@ def test_add_event_no_attributes():
 
 
 def test_default_attributes_in_serialization():
-    exporter = _make_http_serializer(
+    resource = _make_resource(
         service_name="my-svc",
         default_attributes={"env": "prod", "version": "1.0"},
     )
 
     span = _make_finished()
-    body = exporter._serialize_batch([span])
+    body = HTTPExporter._serialize_batch([(span, resource)])
     resource_attrs = {
         a["key"]: a["value"] for a in body["resourceSpans"][0]["resource"]["attributes"]
     }
@@ -753,7 +759,7 @@ def test_manual_status_preserved_on_finish():
 
 def test_double_finish_raises():
     """Calling finish() twice raises RuntimeError."""
-    tracer, exporter = make_tracer()
+    tracer, _ = make_tracer()
     span = tracer.start_span("once-only")
     span.finish()
     with pytest.raises(RuntimeError, match="already been finished"):
@@ -875,7 +881,7 @@ def test_finished_span_has_no_mutable_span_methods():
 
 
 def test_span_traceparent():
-    tracer, exporter = make_tracer()
+    tracer, _ = make_tracer()
     with tracer.span("root") as span:
         tp = span.traceparent()
     assert tp == f"00-{span.trace_id}-{span.span_id}-01"
@@ -932,7 +938,6 @@ def test_tracer_from_env_otlp_exporter(monkeypatch):
     assert http_exp._batch_size == 128
     assert http_exp._flush_interval_seconds == pytest.approx(2.0)
     # service_name forwarded from Tracer
-    assert http_exp._service_name == "env-svc"
     http_exp.shutdown()
 
 
@@ -1059,7 +1064,7 @@ _attrs = st.dictionaries(st.text(min_size=1, max_size=20), _attr_values, max_siz
 @settings(max_examples=40)
 def test_nested_spans_parent_relationships(names):
     """Build a chain of nested spans, verify trace/parent IDs."""
-    tracer, exporter = make_tracer()
+    tracer, _ = make_tracer()
 
     # Build a nested chain using start_span / finish so we
     # can control nesting depth without recursive context managers.
@@ -1101,10 +1106,10 @@ def test_span_timing_invariant(name):
 @settings(max_examples=50)
 def test_otlp_serialization_is_valid_json_with_required_structure(attrs):
     """Arbitrary attributes produce valid OTLP JSON with required keys."""
-    exporter = _make_http_serializer(service_name="prop-test")
+    resource = _make_resource(service_name="prop-test")
 
     span = _make_finished(attributes=attrs)
-    body = exporter._serialize_batch([span])
+    body = HTTPExporter._serialize_batch([(span, resource)])
 
     # Must be serialisable to JSON without error.
     raw = json.dumps(body)
@@ -1123,10 +1128,10 @@ def test_otlp_serialization_is_valid_json_with_required_structure(attrs):
 @settings(max_examples=50)
 def test_otlp_attribute_types_are_preserved(attrs):
     """Each Python type maps to the correct OTLP typed value wrapper."""
-    exporter = _make_http_serializer(service_name="prop-test")
+    resource = _make_resource(service_name="prop-test")
 
     span = _make_finished(attributes=attrs)
-    body = exporter._serialize_batch([span])
+    body = HTTPExporter._serialize_batch([(span, resource)])
     otlp_attrs = {
         a["key"]: a["value"]
         for a in body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
@@ -1150,7 +1155,7 @@ def test_otlp_attribute_types_are_preserved(attrs):
 @settings(max_examples=40)
 def test_traceparent_always_parseable(name, attrs):
     """span.traceparent() always returns a parseable header."""
-    tracer, exporter = make_tracer()
+    tracer, _ = make_tracer()
     with tracer.span(name, attributes=attrs) as span:
         header = span.traceparent()
 
