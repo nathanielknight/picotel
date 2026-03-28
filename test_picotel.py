@@ -1091,6 +1091,16 @@ def test_nested_spans_parent_relationships(names):
     assert len(span_ids) == len(set(span_ids))
 
 
+def test_finish_respects_already_set_end_time():
+    """Manual setting of end_time_ns is respected by finish()."""
+    tracer, exporter = make_tracer()
+    span = tracer.start_span("manual-end")
+    manual_end = span.start_time_ns + 1000
+    span.end_time_ns = manual_end
+    span.finish()
+    assert exporter.spans[0].end_time_ns == manual_end
+
+
 @given(st.text(min_size=1, max_size=100))
 @settings(max_examples=50)
 def test_span_timing_invariant(name):

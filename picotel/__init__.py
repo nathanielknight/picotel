@@ -186,7 +186,7 @@ class Span:
                 "Each span can only be finished once."
             )
         self._finished = True
-        end_ns = time.time_ns()
+        end_ns = self.end_time_ns if self.end_time_ns is not None else time.time_ns()
         self.end_time_ns = end_ns
         if exc_info and exc_info[0] is not None:
             self.status = "ERROR"
